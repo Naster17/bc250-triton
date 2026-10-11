@@ -3369,6 +3369,31 @@ def convert_fp8_to_fp32(x, device, dtype_str):
     raise AssertionError("Unsupported float8 dtype")
 
 
+@pytest.mark.parametrize("dtype_str", ["float16", "bfloat16", "int8"])
+def test_dot_gfx1013_scalar_fallback(dtype_str, device):
+    if not is_hip() or triton.runtime.driver.active.get_current_target().arch != "gfx1013":
+        pytest.skip("requires native gfx1013")
+
+    @triton.jit
+    def kernel(A, B, C):
+        rows = tl.arange(0, 16)
+        cols = tl.arange(0, 16)
+        a = tl.load(A + rows[:, None] * 16 + cols[None, :])
+        b = tl.load(B + rows[:, None] * 16 + cols[None, :])
+        result = tl.dot(a, b, input_precision="ieee")
+        tl.store(C + rows[:, None] * 16 + cols[None, :], result)
+
+    dtype = getattr(torch, dtype_str)
+    a = torch.randint(-4, 5, (16, 16), dtype=torch.int32).to(dtype)
+    b = torch.randint(-4, 5, (16, 16), dtype=torch.int32).to(dtype)
+    output_dtype = torch.int32 if dtype == torch.int8 else torch.float32
+    reference = (a.double() @ b.double()).to(output_dtype)
+    result = torch.empty((16, 16), dtype=output_dtype, device=device)
+    compiled = kernel[(1, )](a.to(device), b.to(device), result, num_warps=4)
+    torch.testing.assert_close(result.cpu(), reference, rtol=0, atol=0)
+    assert not re.search(r"\bv_(?:dot[24]|mfma|wmma)", compiled.asm["amdgcn"])
+
+
 # M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dtype, out_dtype, kpack, mma_nonk_size
 def get_test_dot_base_cases():
     return [(*shape, 4, False, False, epilogue, input_precision, in_dtype, out_dtype, 1, None)

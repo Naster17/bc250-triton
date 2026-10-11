@@ -1,3 +1,5 @@
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
+#include "third_party/amd/lib/TritonAMDGPUToLLVM/ConvertFpCastOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/FMADotUtility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -13,6 +15,7 @@ struct DotIntrinsic {
   Type outElemTy;
   StringRef intrinsicName;
   SmallVector<Value> additionalArgs;
+  bool scalarInteger = false;
 };
 
 class AMDFMAVectorMultiplier : public FMAVectorMultiplier {
@@ -30,6 +33,22 @@ class AMDFMAVectorMultiplier : public FMAVectorMultiplier {
     DotIntrinsic chosenOp;
 
     auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto target =
+        amdgpu::TargetFeatures::fromModuleOp(op->getParentOfType<ModuleOp>());
+    if (target.getArch() == "gfx1013") {
+      if ((aElemTy.isF16() || aElemTy.isBF16()) && dElemTy.isF32()) {
+        chosenOp.vectorSize = 1;
+        chosenOp.outElemTy = dElemTy;
+        chosenOp.intrinsicName = "llvm.fmuladd.f32";
+        return chosenOp;
+      }
+      if (aElemTy.isInteger(8) && dElemTy.isInteger(32)) {
+        chosenOp.vectorSize = 1;
+        chosenOp.outElemTy = dElemTy;
+        chosenOp.scalarInteger = true;
+        return chosenOp;
+      }
+    }
     if ((aElemTy.isF16() || aElemTy.isBF16()) && dElemTy.isF32()) {
       chosenOp.vectorSize = 2;
       chosenOp.outElemTy = f32_ty;
@@ -64,8 +83,18 @@ class AMDFMAVectorMultiplier : public FMAVectorMultiplier {
 
   Value packOperand(ArrayRef<Value> scalarValues, int firstElemPos,
                     unsigned vectorSize) {
-    if (vectorSize == 1)
-      return scalarValues[firstElemPos];
+    if (vectorSize == 1) {
+      auto scalar = scalarValues[firstElemPos];
+      auto scalarType = scalar.getType();
+      if (scalarType == intrinsic.outElemTy)
+        return scalar;
+      if (scalarType.isBF16())
+        return triton::AMD::convertBf16ToFp32(loc, rewriter, scalar);
+      if (scalarType.isF16())
+        return LLVM::FPExtOp::create(rewriter, loc, intrinsic.outElemTy,
+                                     scalar);
+      return LLVM::SExtOp::create(rewriter, loc, intrinsic.outElemTy, scalar);
+    }
     auto elemTy = scalarValues[firstElemPos].getType();
     auto vecTy = vec_ty(elemTy, vectorSize);
     auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -90,6 +119,10 @@ class AMDFMAVectorMultiplier : public FMAVectorMultiplier {
   }
 
   Value generateDotInstr(Value a, Value b, Value c) {
+    if (intrinsic.scalarInteger) {
+      auto product = LLVM::MulOp::create(rewriter, loc, a, b);
+      return LLVM::AddOp::create(rewriter, loc, product, c);
+    }
     SmallVector<Value> args{a, b, c};
     args.append(intrinsic.additionalArgs.begin(),
                 intrinsic.additionalArgs.end());
