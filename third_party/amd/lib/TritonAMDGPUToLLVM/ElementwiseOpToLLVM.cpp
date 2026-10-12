@@ -1,4 +1,5 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TargetInfo.h"
 #include "Utility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -93,7 +94,9 @@ struct FMulOpConversion
     auto lhsElemTy = getElementTypeOrSelf(op.getLhs());
     auto rhsElemTy = getElementTypeOrSelf(op.getRhs());
     if (lhsElemTy.isBF16() && rhsElemTy.isBF16()) {
-      if (triton::amdgpu::isRDNA(isaFamily)) {
+      auto target = triton::amdgpu::TargetFeatures::fromModuleOp(
+          op->getParentOfType<ModuleOp>());
+      if (triton::amdgpu::isRDNA(isaFamily) && target.getArch() != "gfx1013") {
         // To avoid casting to/from fp32, we compute a dot product with one
         // element of each vector set to zero.
         auto b = TritonLLVMOpBuilder(loc, rewriter);
